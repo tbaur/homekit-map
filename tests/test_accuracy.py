@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from homekit_map.cli import main
 from homekit_map.day import format_day
@@ -260,6 +261,21 @@ class ExportTests(unittest.TestCase):
             with self.assertRaises(SnapshotError):
                 write_catalog(database, output)
             self.assertEqual(elsewhere.read_text(), "keep\n")
+
+    def test_export_refuses_the_live_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "core.sqlite"
+            build_store(database)
+            live = Path(tmp) / "Library" / "HomeKit"
+            live.mkdir(parents=True)
+            for output in (live / "export.json", live / "new" / "export.json"):
+                with (
+                    self.subTest(output=output.relative_to(tmp)),
+                    patch("homekit_map.extract.LIVE_HOMEKIT_DIR", live),
+                    self.assertRaises(SnapshotError),
+                ):
+                    write_catalog(database, output)
+            self.assertEqual(list(live.iterdir()), [])
 
 
 if __name__ == "__main__":
