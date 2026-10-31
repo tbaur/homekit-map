@@ -166,6 +166,7 @@ def format_accessories(items: list[Accessory]) -> str:
 
 
 def _matches(item: Accessory, needle: str, scope: str | None = None) -> bool:
+    fields: tuple[str | None, ...]
     if scope == "maker":
         fields = (item.manufacturer, item.model)
     elif scope == "accessory":

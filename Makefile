@@ -8,7 +8,7 @@ PIP := $(VENV)/bin/pip
 
 .DEFAULT_GOAL := install
 
-.PHONY: help install build test lint check clean
+.PHONY: help install build test lint typecheck check clean
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
@@ -33,8 +33,11 @@ test: install ## pytest with the coverage gate in pyproject.toml
 lint: install ## Ruff
 	$(VENV)/bin/ruff check src tests
 
-check: lint test ## Everything CI runs except pip-audit
+typecheck: install ## mypy in strict mode
+	$(PYTHON) -m mypy
+
+check: lint typecheck test ## Everything CI runs except pip-audit
 
 clean: ## Remove .venv, build output, and caches
 	rm -rf $(VENV) $(ROOT)/build $(ROOT)/dist $(ROOT)/src/*.egg-info $(ROOT)/*.egg-info
-	rm -rf $(ROOT)/.pytest_cache $(ROOT)/.ruff_cache $(ROOT)/.coverage
+	rm -rf $(ROOT)/.pytest_cache $(ROOT)/.ruff_cache $(ROOT)/.mypy_cache $(ROOT)/.coverage

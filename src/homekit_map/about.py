@@ -96,10 +96,10 @@ def describe(connection: sqlite3.Connection, text: str) -> Report:
     if not needle_cf:
         return Report((), (), (), (), kind)
     schema = load_schema(connection)
-    accessories = ()
-    automations = ()
-    scenes = ()
-    rooms = ()
+    accessories: tuple[Accessory, ...] = ()
+    automations: tuple[Automation, ...] = ()
+    scenes: tuple[Scene, ...] = ()
+    rooms: tuple[Room, ...] = ()
     if kind in (None, "accessory", "maker"):
         accessories = tuple(find_accessories(connection, needle, kind))
     if kind in (None, "automation"):
@@ -124,16 +124,16 @@ def format_report(report: Report) -> str:
     if report.accessories:
         lines.append("")
         lines.append(format_accessories(list(report.accessories)).rstrip("\n"))
-    for item in report.automations:
-        lines.extend(_automation_lines(item))
-    for item in report.scenes:
-        lines.extend(_scene_lines(item))
-    for item in report.rooms:
+    for automation in report.automations:
+        lines.extend(_automation_lines(automation))
+    for scene in report.scenes:
+        lines.extend(_scene_lines(scene))
+    for room in report.rooms:
         lines.append("")
-        lines.append(f"room: {item.name}")
-        if item.accessories:
+        lines.append(f"room: {room.name}")
+        if room.accessories:
             lines.append("  accessories:")
-            lines.extend(f"    {name}" for name in item.accessories)
+            lines.extend(f"    {name}" for name in room.accessories)
         else:
             lines.append("  accessories: none")
     return "\n".join(lines) + "\n"
@@ -158,15 +158,15 @@ def _format_one_kind(report: Report) -> str:
         if not report.automations:
             return "automations: 0\n"
         lines = []
-        for item in report.automations:
-            lines.extend(_automation_lines(item))
+        for automation in report.automations:
+            lines.extend(_automation_lines(automation))
         return "\n".join(lines).lstrip("\n") + "\n"
     if report.kind == "scene":
         if not report.scenes:
             return "scenes: 0\n"
         lines = []
-        for item in report.scenes:
-            lines.extend(_scene_lines(item))
+        for scene in report.scenes:
+            lines.extend(_scene_lines(scene))
         return "\n".join(lines).lstrip("\n") + "\n"
     if not report.accessories:
         label = "makers" if report.kind == "maker" else "accessories"

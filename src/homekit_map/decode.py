@@ -79,9 +79,9 @@ def _decode_number(value: bytes, fmt: str | None) -> float | int | None:
     if tag == 0x31 and len(rest) == 2:
         return int.from_bytes(rest, "little")
     if tag == 0x35 and len(rest) == 4:
-        return struct.unpack("<f", rest)[0]
+        return float(struct.unpack("<f", rest)[0])
     if tag == 0x36 and len(rest) == 8:
-        return struct.unpack("<d", rest)[0]
+        return float(struct.unpack("<d", rest)[0])
     return None
 
 

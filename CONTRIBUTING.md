@@ -22,11 +22,12 @@ make check
 |---|---|
 | `make install` | Creates `.venv` and installs the tool with dev extras |
 | `make lint` | Ruff |
+| `make typecheck` | mypy in strict mode |
 | `make test` | pytest with the coverage gate (`fail_under` in `pyproject.toml`) |
-| `make check` | `lint` and `test` |
+| `make check` | `lint`, `typecheck`, and `test` |
 | `make clean` | Removes `.venv`, build output, and caches |
 
-CI runs `make lint`, `make test`, and `pip-audit` on Python 3.11, 3.13, 3.14, and 3.15. A final `Tests passed` job is the required check.
+CI runs `make lint`, `make typecheck`, `make test`, and `pip-audit` on Python 3.11, 3.13, 3.14, and 3.15. A final `Tests passed` job is the required check.
 
 Test data must be placeholders. Use the names already in `tests/fixture.py`, and never copy values from your own snapshot.
 

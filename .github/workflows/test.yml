@@ -31,6 +31,8 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Lint
         run: make lint
+      - name: Type check
+        run: make typecheck
       - name: Test
         run: make test
       - name: pip-audit

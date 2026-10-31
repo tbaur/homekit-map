@@ -196,9 +196,15 @@ def _weekday_heading(mask: int) -> str:
     return _days_label(mask).lower()
 
 
+def _whole_seconds(value: object) -> int:
+    if isinstance(value, int | float | str) and value:
+        return int(float(value))
+    return 0
+
+
 def _sun(event: object, seconds: object) -> str:
     name = text_or_none(event) or "sun"
-    total = int(float(seconds or 0))
+    total = _whole_seconds(seconds)
     if total == 0:
         return name
     direction = "before" if total < 0 else "after"
@@ -221,7 +227,7 @@ def _presence(value: object) -> str:
 
 
 def _duration(seconds: object) -> str:
-    total = int(float(seconds or 0))
+    total = _whole_seconds(seconds)
     if total <= 0:
         return "duration"
     if total % 3600 == 0:
