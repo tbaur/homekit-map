@@ -5,4 +5,4 @@
 
 """A map of HomeKit, built from a read-only snapshot of its database."""
 
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "1.0.0"  # x-release-please-version
