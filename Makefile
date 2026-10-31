@@ -21,6 +21,7 @@ build: install
 
 $(VENV)/bin/python:
 	python3 -m venv $(VENV)
+	$(PIP) install --upgrade pip setuptools
 
 $(VENV)/bin/homekit-map: $(VENV)/bin/python pyproject.toml
 	$(PIP) install -e "$(ROOT)[dev]"
