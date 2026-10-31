@@ -59,7 +59,9 @@ def _hits(connection: sqlite3.Connection, node: object) -> list[PredicateHit]:
     name = _classname(node)
     if name == "NSCompoundPredicate":
         children = _array(node.get("NSSubpredicates"))
-        direct = [child for child in children if _classname(child) == "NSComparisonPredicate"]
+        direct = [
+            child for child in children if isinstance(child, dict) and _classname(child) == "NSComparisonPredicate"
+        ]
         nested = [child for child in children if _classname(child) != "NSComparisonPredicate"]
         found = _paired(connection, direct)
         for child in nested:
@@ -75,8 +77,8 @@ def _hits(connection: sqlite3.Connection, node: object) -> list[PredicateHit]:
     return []
 
 
-def _paired(connection: sqlite3.Connection, comparisons: list[dict]) -> list[PredicateHit]:
-    identities: list[dict] = []
+def _paired(connection: sqlite3.Connection, comparisons: list[dict[str, object]]) -> list[PredicateHit]:
+    identities: list[dict[str, object]] = []
     values: list[tuple[str, object]] = []
     for comparison in comparisons:
         key = _keypath(comparison.get("NSLeftExpression"))
@@ -93,7 +95,7 @@ def _paired(connection: sqlite3.Connection, comparisons: list[dict]) -> list[Pre
 
 
 def _characteristic_hit(
-    connection: sqlite3.Connection, identity: dict, relation: str, value: object
+    connection: sqlite3.Connection, identity: dict[str, object], relation: str, value: object
 ) -> PredicateHit:
     located = _locate(
         connection,
@@ -124,7 +126,7 @@ def _negated(hit: PredicateHit) -> PredicateHit:
 
 def _int(value: object, default: int) -> int:
     """An archived integer. 0 is a real value here, so it must not fall back to the default."""
-    if value is None:
+    if not isinstance(value, int | float | str):
         return default
     try:
         return int(value)
@@ -210,7 +212,7 @@ def _keypath(node: object) -> str | None:
     return None
 
 
-def _array(node: object) -> list:
+def _array(node: object) -> list[object]:
     if isinstance(node, dict) and isinstance(node.get("NS.objects"), list):
         return list(node["NS.objects"])
     if isinstance(node, list):
@@ -227,7 +229,7 @@ def _classname(node: object) -> str:
     return ""
 
 
-def _root(blob: bytes | None) -> dict | None:
+def _root(blob: bytes | None) -> dict[str, object] | None:
     if not blob:
         return None
     try:
@@ -254,7 +256,7 @@ class _Unreadable(Exception):
 _MAX_DEPTH = 64
 
 
-def _resolve(objects: list, node: object, path: frozenset[int], depth: int) -> object:
+def _resolve(objects: list[object], node: object, path: frozenset[int], depth: int) -> object:
     if depth > _MAX_DEPTH:
         raise _Unreadable
     if isinstance(node, plistlib.UID):

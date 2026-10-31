@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from homekit_map.schema import load_schema, quote_ident
+from homekit_map.schema import StoreSchema, load_schema, quote_ident
 
 
 def format_unused(connection: sqlite3.Connection) -> str:
@@ -79,7 +79,7 @@ def _disabled(connection: sqlite3.Connection) -> list[str]:
     return [str(row["label"]) for row in rows]
 
 
-def _unlinked_scenes(connection: sqlite3.Connection, schema) -> list[str]:
+def _unlinked_scenes(connection: sqlite3.Connection, schema: StoreSchema) -> list[str]:
     junction = quote_ident(schema.junction)
     action_column = quote_ident(schema.action_column)
     rows = connection.execute(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from homekit_map.about import describe, format_report, split_search
@@ -171,7 +172,7 @@ def _print_day(database: Path | None, text: str) -> int:
     return _print_query(database, lambda connection: format_day(connection, weekday))
 
 
-def _print_query(database: Path | None, render) -> int:
+def _print_query(database: Path | None, render: Callable[[sqlite3.Connection], str]) -> int:
     connection = open_readonly(_database(database))
     try:
         text = render(connection)
