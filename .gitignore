@@ -1,0 +1,23 @@
+# The snapshot is a copy of this Mac's HomeKit database. It holds pairing
+# material and the names of rooms and accessories. Never commit it.
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.partial
+export.json
+*.export.json
+*.partial
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage

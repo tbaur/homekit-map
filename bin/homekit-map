@@ -1,0 +1,31 @@
+#!/bin/sh
+# Copyright (c) 2026 tbaur
+#
+# Licensed under the Apache License, Version 2.0
+# See LICENSE file for full license text
+
+# Run this checkout's install. The working directory does not matter.
+set -e
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+TOOL="$ROOT/.venv/bin/homekit-map"
+PY="$ROOT/.venv/bin/python"
+
+venv_ok() {
+  [ -x "$PY" ] && [ -x "$TOOL" ] || return 1
+  interp=$(sed -n '1s/^#!//p' "$TOOL")
+  case "$interp" in
+    "$ROOT"/.venv/bin/python*) ;;
+    *) return 1 ;;
+  esac
+  "$PY" -c 'import sys' >/dev/null 2>&1
+}
+
+if ! venv_ok; then
+  rm -rf "$ROOT/.venv"
+  make -C "$ROOT" install
+fi
+
+if [ $# -eq 0 ]; then
+  set -- --help
+fi
+exec "$TOOL" "$@"
