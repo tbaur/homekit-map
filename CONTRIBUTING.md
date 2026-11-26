@@ -55,8 +55,9 @@ homekit-map/
 ├── src/homekit_map/       # the package
 │   ├── cli.py             # argument parsing and command dispatch
 │   ├── backup.py          # read-only copy of the live database
-│   ├── query.py, day.py, gaps.py, diff.py, extract.py
-│   └── decode.py, predicate.py, schema.py, about.py
+│   ├── query.py, about.py, day.py, gaps.py, diff.py, extract.py
+│   ├── model.py, events.py, names.py   # automations, events, and names read once
+│   └── decode.py, predicate.py, schema.py
 ├── tests/                 # unittest-style tests run by pytest
 └── docs/                  # query fields and backup safety
 ```

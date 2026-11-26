@@ -85,6 +85,8 @@ def _accessory(item: Accessory) -> dict[str, object]:
 
 def _use(use: Use) -> dict[str, object]:
     body: dict[str, object] = {"name": use.name, "role": use.role}
+    if use.scene:
+        body["scene"] = use.scene
     if use.enabled is not None:
         body["enabled"] = use.enabled
     if use.service:
