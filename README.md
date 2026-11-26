@@ -17,10 +17,10 @@ The Home app shows one thing at a time. You can open an automation and see what 
 
 homekit-map copies that database without writing to it, then answers questions from the copy:
 
-- **Search** any accessory, room, automation, or scene. An accessory shows every automation and scene that touches it, with the trigger, the conditions, and the value it sets.
+- **Search** any accessory, room, automation, or scene. An accessory shows every automation and scene that touches it, with the trigger, the conditions, the value it sets, and when it turns off.
 - **Schedule** lists what runs by time of day, sunrise, sunset, and presence, for the week or a day.
-- **Unused** lists accessories that no automation uses, automations that are turned off, and scenes nothing runs.
-- **Diff** shows what changed between two backups, so you can see what an edit in the Home app actually did.
+- **Unused** lists accessories that no automation or scene uses, automations that are turned off or can never do anything, and scenes nothing runs.
+- **Diff** shows what changed between two backups: what was added, removed, renamed, moved to another room, or turned on or off, and what changed inside an automation or scene.
 - **Extract** writes the whole map to JSON for your own scripts.
 
 It only reads. It never changes your home, and it never talks to your accessories or to Apple.
@@ -56,7 +56,10 @@ accessory 1: Example Outlet
   device: Example Strip
   automations:
     Evening [enabled]
+      trigger  16:00
+      condition  between sunset and sunrise
       action  service=Example Outlet  characteristic=Power State  target=true
+      turn off  after 1 hour
       also:
         Lamp
   scenes:
@@ -66,7 +69,7 @@ accessory 1: Example Outlet
   notifications: none
 ```
 
-The Evening automation turns this outlet on and also controls Lamp. The Away scene turns it off. Nothing triggers on it, and it sends no notifications. `provided` is the name the accessory reported before it was renamed in the Home app. [docs/query.md](docs/query.md) has examples of every kind of answer.
+The Evening automation starts at 16:00. It runs only between sunset and sunrise, turns this outlet on, and also controls Lamp. An hour later it turns them off again. The Away scene turns the outlet off. Nothing triggers on it, and it sends no notifications. `provided` is the name the accessory reported before it was renamed in the Home app. [docs/query.md](docs/query.md) has examples of every kind of answer.
 
 ## Search
 
@@ -76,11 +79,11 @@ bin/homekit-map search day tuesday
 bin/homekit-map search unused
 ```
 
-The words after `search` are the question, so quotes are optional. `search Outlet A` looks across accessories, automations, scenes, and rooms. A first word of `room`, `accessory`, `automation`, `scene`, or `maker` limits that question. `search room Zone One` finds the Zone One room. `search day` is the schedule, and `search day tuesday` keeps the automations that run on Tuesday. `search unused` is accessories in no automation, disabled automations, and scenes nothing runs.
+The words after `search` are the question, so quotes are optional. `search Outlet A` looks across accessories, automations, scenes, and rooms. A first word of `room`, `accessory`, `automation`, `scene`, or `maker` limits that question. `search room Zone One` finds the Zone One room. `search day` is the schedule, and `search day tuesday` keeps the automations that run on Tuesday. `search unused` is accessories that no automation or scene uses, disabled automations, scenes nothing runs, and automations that do nothing.
 
-An accessory hit lists each automation once. The automation lists its trigger, then its condition, then that accessory's actions and the other accessories it writes. Scenes, triggers, and notifications are separate. An automation hit uses the same order: what starts it, its conditions, and what it writes. A scene hit lists its actions and which automations run it. A room hit lists the accessories in that room.
+An accessory hit lists each automation once. The automation lists its trigger, then its conditions, then that accessory's actions and the other accessories it writes, then when it turns off. Conditions include time windows, such as between sunset and sunrise, and tests on other accessories. Scenes, triggers, and notifications are separate. When an accessory's tiles have names of their own, such as the outlets of a power strip, the accessory lists them. An automation hit uses the same order: what starts it, its conditions, when it turns off, and what it writes. A scene hit lists its actions and which automations run it. A room hit lists the accessories in that room.
 
-`search day` is the clock, sunrise, sunset, presence, and durations. Daily automations are included in a weekday. A weekend-only automation is not. The full schedule labels weekends and weekdays when an automation is limited to those days.
+`search day` is the clock, sunrise, sunset, and presence. Daily automations are included in a weekday. A weekend-only automation is not. The full schedule labels weekends and weekdays when an automation is limited to those days. A Turn Off time is when an automation ends, so the schedule leaves it out.
 
 ## Diff
 
@@ -90,6 +93,10 @@ bin/homekit-map diff versions
 ```
 
 `diff` compares the current snapshot with the newest file in `data/versions/`. Pass one stamp to compare that version with current, or two stamps to compare those versions. `diff versions` lists the saved copies, then `current`. When nothing has changed, `diff` says `no changes`.
+
+It covers accessories, services, rooms, automations, and scenes, including HomePods, Apple TVs, and AirPlay speakers. A service is one tile of an accessory in the Home app, such as one outlet of a power strip. Renaming a tile often changes only the service, so a renamed service is listed with `accessory=` and the accessory's own name. A renamed room is one line, and the accessories in it are not reported as moved. Each object is matched by HomeKit's own id, so a rename shows as a rename and not as a remove and an add.
+
+An `edited` automation or scene lists what changed inside it: a line that starts with `-` was there before, and a line that starts with `+` is there now. Renaming an accessory does not mark the automations that use it as edited.
 
 ## Extract
 
@@ -101,9 +108,11 @@ That writes `data/export.json`. The file does not record the path of the databas
 
 ## What a value means
 
-`true` and `false` are power and other bool writes. A number with `%` is a percentage, such as brightness. `°` is hue. Other numbers are shown as stored. A characteristic name comes from the service the write belongs to.
+`true` and `false` are power and other on or off values. Known states read as words, such as `single press`, `open`, or `locked`. A number with `%` is a percentage, such as brightness. `°` is hue, `°C` is a temperature, and `lux` is a light level. Other numbers are shown as stored. A characteristic name comes from the service the write belongs to.
 
 Shortcut workflows that refer to an accessory only by an internal id are not resolved. Those ids do not match the accessory ids in the database. If the shortcut text contains the name, the hit is still reported.
+
+A play or pause action lists each speaker it controls. It does not say whether it plays or pauses, because HomeKit does not document how it stores that setting.
 
 ## Commands
 

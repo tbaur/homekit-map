@@ -13,22 +13,22 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from homekit_map.day import trigger_headings
-from homekit_map.decode import decode_target
-from homekit_map.predicate import predicate_hits
+from homekit_map.model import Action, ActionSet, Model, load_model
+from homekit_map.names import Names, load_names
 from homekit_map.query import Accessory, find_accessories, format_accessories
-from homekit_map.schema import StoreSchema, column_exists, is_active, load_schema, quote_ident, text_or_none
+from homekit_map.schema import text_or_none
 
 
 @dataclass(frozen=True)
 class Step:
-    """One trigger or write inside an automation or scene."""
+    """One write inside an automation or scene. scene names the scene an automation runs it through."""
 
     accessory: str | None
     service: str | None
     characteristic: str | None
     target: str | None
     kind: str
+    scene: str | None = None
 
 
 @dataclass(frozen=True)
@@ -36,10 +36,10 @@ class Automation:
     name: str
     enabled: bool
     trigger_type: str
-    triggers: tuple[Step, ...]
+    starts: tuple[str, ...]
     actions: tuple[Step, ...]
     conditions: tuple[str, ...] = ()
-    trigger_lines: tuple[str, ...] = ()
+    ends: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,8 +51,10 @@ class Scene:
 
 @dataclass(frozen=True)
 class Room:
+    """A room and its accessories, each with the tiles that have a name of their own."""
+
     name: str
-    accessories: tuple[str, ...]
+    accessories: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,8 @@ _KINDS = {
     "automations": "automation",
     "scene": "scene",
     "scenes": "scene",
+    "maker": "maker",
+    "makers": "maker",
     "day": "day",
     "days": "day",
     "unused": "unused",
@@ -95,19 +99,21 @@ def describe(connection: sqlite3.Connection, text: str) -> Report:
     needle_cf = needle.casefold()
     if not needle_cf:
         return Report((), (), (), (), kind)
-    schema = load_schema(connection)
     accessories: tuple[Accessory, ...] = ()
     automations: tuple[Automation, ...] = ()
     scenes: tuple[Scene, ...] = ()
     rooms: tuple[Room, ...] = ()
+    names = load_names(connection)
     if kind in (None, "accessory", "maker"):
         accessories = tuple(find_accessories(connection, needle, kind))
-    if kind in (None, "automation"):
-        automations = tuple(_matching_automations(connection, schema, needle_cf))
-    if kind in (None, "scene"):
-        scenes = tuple(_matching_scenes(connection, schema, needle_cf))
+    if kind in (None, "automation", "scene"):
+        model = load_model(connection, names)
+        if kind in (None, "automation"):
+            automations = tuple(_matching_automations(model, needle_cf))
+        if kind in (None, "scene"):
+            scenes = tuple(_matching_scenes(model, needle_cf))
     if kind in (None, "room"):
-        rooms = tuple(_matching_rooms(connection, needle_cf))
+        rooms = tuple(_matching_rooms(connection, names, needle_cf))
     return Report(accessories, automations, scenes, rooms, kind)
 
 
@@ -130,13 +136,53 @@ def format_report(report: Report) -> str:
         lines.extend(_scene_lines(scene))
     for room in report.rooms:
         lines.append("")
-        lines.append(f"room: {room.name}")
-        if room.accessories:
-            lines.append("  accessories:")
-            lines.extend(f"    {name}" for name in room.accessories)
-        else:
-            lines.append("  accessories: none")
+        lines.extend(_room_lines(room))
     return "\n".join(lines) + "\n"
+
+
+def step_of(action: Action, scene: str | None = None) -> Step:
+    return Step(
+        accessory=action.accessory,
+        service=action.service,
+        characteristic=action.characteristic,
+        target=action.target,
+        kind=action.role,
+        scene=scene,
+    )
+
+
+def step_text(step: Step) -> str:
+    lead = [f"scene {step.scene}"] if step.scene else []
+    if step.kind == "adaptive lighting":
+        who = step.accessory or "light"
+        state = "on" if step.target == "on" else "off"
+        return "  ".join([*lead, who, f"adaptive lighting {state}"])
+    if step.accessory:
+        detail = [*lead, step.accessory]
+        if step.kind not in {"write", "action"}:
+            detail.append(step.kind)
+    else:
+        detail = [*lead, step.kind]
+    if step.service:
+        detail.append(f"service={step.service}")
+    if step.characteristic:
+        detail.append(f"characteristic={step.characteristic}")
+    if step.target:
+        detail.append(f"target={step.target}")
+    return "  ".join(detail)
+
+
+def automation_steps(model: Model, trigger_pk: int) -> tuple[Step, ...]:
+    """The automation's own actions first, then each scene it runs."""
+    steps: list[Step] = []
+    for action_set in _ordered_sets(model.sets_of(trigger_pk)):
+        scene = (action_set.name or "(unnamed)") if action_set.is_scene else None
+        steps.extend(step_of(action, scene) for action in model.by_set.get(action_set.pk, ()))
+    return tuple(steps)
+
+
+def _ordered_sets(sets: tuple[ActionSet, ...]) -> list[ActionSet]:
+    return sorted(sets, key=lambda item: (item.is_scene, (item.name or "").casefold(), item.pk))
 
 
 def _format_one_kind(report: Report) -> str:
@@ -146,12 +192,7 @@ def _format_one_kind(report: Report) -> str:
             return "rooms: 0\n"
         lines: list[str] = []
         for item in report.rooms:
-            lines.append(f"room: {item.name}")
-            if item.accessories:
-                lines.append("  accessories:")
-                lines.extend(f"    {name}" for name in item.accessories)
-            else:
-                lines.append("  accessories: none")
+            lines.extend(_room_lines(item))
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
     if report.kind == "automation":
@@ -177,19 +218,19 @@ def _format_one_kind(report: Report) -> str:
 def _automation_lines(item: Automation) -> list[str]:
     state = "enabled" if item.enabled else "disabled"
     lines = ["", f"automation: {item.name}", f"  {state}", f"  type: {item.trigger_type}"]
-    if item.trigger_lines:
-        lines.append("  trigger:")
-        lines.extend(f"    {line}" for line in item.trigger_lines)
-        detailed = tuple(step for step in item.triggers if step.accessory or step.characteristic)
-        if detailed:
-            _append_steps(lines, "triggers", detailed)
-    else:
-        _append_steps(lines, "triggers", item.triggers)
-    if item.conditions:
-        lines.append("  condition:")
-        lines.extend(f"    {line}" for line in item.conditions)
+    _append_texts(lines, "trigger", item.starts, always=True)
+    _append_texts(lines, "condition", item.conditions)
+    _append_texts(lines, "turn off", item.ends)
     _append_steps(lines, "actions", item.actions)
     return lines
+
+
+def _append_texts(lines: list[str], heading: str, texts: tuple[str, ...], *, always: bool = False) -> None:
+    if texts:
+        lines.append(f"  {heading}:")
+        lines.extend(f"    {text}" for text in texts)
+    elif always:
+        lines.append(f"  {heading}: none")
 
 
 def _scene_lines(item: Scene) -> list[str]:
@@ -203,229 +244,75 @@ def _scene_lines(item: Scene) -> list[str]:
     return lines
 
 
+def _room_lines(item: Room) -> list[str]:
+    lines = [f"room: {item.name}"]
+    if not item.accessories:
+        lines.append("  accessories: none")
+        return lines
+    lines.append("  accessories:")
+    for name, tiles in item.accessories:
+        lines.append(f"    {name}")
+        lines.extend(f"      {tile}" for tile in tiles)
+    return lines
+
+
 def _append_steps(lines: list[str], heading: str, steps: tuple[Step, ...]) -> None:
     if not steps:
         lines.append(f"  {heading}: none")
         return
     lines.append(f"  {heading}:")
-    for step in steps:
-        if step.kind == "adaptive lighting":
-            who = step.accessory or "light"
-            state = "on" if step.target == "on" else "off"
-            lines.append(f"    {who}  adaptive lighting {state}")
-            continue
-        if step.accessory:
-            detail = [step.accessory]
-            if step.kind not in {"write", "action"}:
-                detail.append(step.kind)
-        else:
-            detail = [step.kind]
-        if step.service:
-            detail.append(f"service={step.service}")
-        if step.characteristic:
-            detail.append(f"characteristic={step.characteristic}")
-        if step.target:
-            detail.append(f"target={step.target}")
-        lines.append("    " + "  ".join(detail))
+    lines.extend(f"    {step_text(step)}" for step in steps)
 
 
-def _matching_automations(
-    connection: sqlite3.Connection, schema: StoreSchema, needle: str
-) -> list[Automation]:
+def _matching_automations(model: Model, needle: str) -> list[Automation]:
     found: list[Automation] = []
-    headings = trigger_headings(connection)
-    rows = connection.execute(
-        "SELECT Z_PK, Z_ENT, ZCONFIGUREDNAME, ZNAME, ZACTIVE FROM ZMKFTRIGGER"
-    ).fetchall()
-    for row in rows:
-        name = text_or_none(row["ZCONFIGUREDNAME"]) or text_or_none(row["ZNAME"]) or "(unnamed)"
-        if needle not in name.casefold():
+    for trigger in model.triggers.values():
+        if needle not in trigger.label.casefold():
             continue
-        pk = int(row["Z_PK"])
         found.append(
             Automation(
-                name=name,
-                enabled=is_active(row["ZACTIVE"]),
-                trigger_type=schema.label("trigger", int(row["Z_ENT"])),
-                triggers=_event_steps(connection, schema, pk),
-                actions=_action_steps(connection, schema, pk),
-                conditions=_condition_lines(connection, pk),
-                trigger_lines=(headings[pk],) if pk in headings else (),
+                name=trigger.label,
+                enabled=trigger.enabled,
+                trigger_type=trigger.kind,
+                starts=tuple(dict.fromkeys(event.text for event in model.starts(trigger.pk))),
+                actions=automation_steps(model, trigger.pk),
+                conditions=tuple(hit.text for hit in model.conditions.get(trigger.pk, ())),
+                ends=tuple(dict.fromkeys(event.text for event in model.ends(trigger.pk))),
             )
         )
     return sorted(found, key=lambda item: item.name.casefold())
 
 
-def _matching_scenes(
-    connection: sqlite3.Connection, schema: StoreSchema, needle: str
-) -> list[Scene]:
+def _matching_scenes(model: Model, needle: str) -> list[Scene]:
     found: list[Scene] = []
-    rows = connection.execute(
-        "SELECT Z_PK, ZNAME FROM ZMKFACTIONSET WHERE ZNAME IS NOT NULL AND ZNAME != ''"
-    ).fetchall()
-    for row in rows:
-        name = str(row["ZNAME"])
-        if needle not in name.casefold():
+    for action_set in model.sets.values():
+        if not action_set.is_scene or not action_set.name or needle not in action_set.name.casefold():
             continue
+        used_by = sorted(
+            (model.triggers[pk].label for pk in action_set.triggers if pk in model.triggers),
+            key=str.casefold,
+        )
         found.append(
             Scene(
-                name=name,
-                actions=_set_steps(connection, schema, int(row["Z_PK"])),
-                used_by=_automations_for_set(connection, schema, int(row["Z_PK"])),
+                name=action_set.name,
+                actions=tuple(step_of(action) for action in model.by_set.get(action_set.pk, ())),
+                used_by=tuple(used_by),
             )
         )
     return sorted(found, key=lambda item: item.name.casefold())
 
 
-def _matching_rooms(connection: sqlite3.Connection, needle: str) -> list[Room]:
+def _matching_rooms(connection: sqlite3.Connection, names: Names, needle: str) -> list[Room]:
     found: list[Room] = []
     rows = connection.execute("SELECT Z_PK, ZNAME FROM ZMKFROOM").fetchall()
     for row in rows:
         name = text_or_none(row["ZNAME"])
         if name is None or needle not in name.casefold():
             continue
-        accessories = connection.execute(
-            """
-            SELECT COALESCE(NULLIF(ZCONFIGUREDNAME, ''), ZPROVIDEDNAME, '(unnamed)') AS label
-            FROM ZMKFACCESSORY
-            WHERE ZROOM = ?
-            ORDER BY label
-            """,
-            (int(row["Z_PK"]),),
-        ).fetchall()
-        found.append(Room(name=name, accessories=tuple(str(item["label"]) for item in accessories)))
+        members: list[tuple[str, tuple[str, ...]]] = []
+        for (pk,) in connection.execute("SELECT Z_PK FROM ZMKFACCESSORY WHERE ZROOM = ?", (int(row["Z_PK"]),)):
+            label = names.accessory(int(pk)) or "(unnamed)"
+            tiles = tuple(tile for tile in names.tile_names(int(pk)) if tile != label)
+            members.append((label, tiles))
+        found.append(Room(name=name, accessories=tuple(sorted(members, key=lambda item: item[0].casefold()))))
     return found
-
-
-def _condition_lines(connection: sqlite3.Connection, trigger_pk: int) -> tuple[str, ...]:
-    if not column_exists(connection, "ZMKFTRIGGER", "ZEVALUATIONCONDITION"):
-        return ()
-    row = connection.execute(
-        "SELECT ZEVALUATIONCONDITION FROM ZMKFTRIGGER WHERE Z_PK = ?",
-        (trigger_pk,),
-    ).fetchone()
-    blob = row["ZEVALUATIONCONDITION"] if row is not None else None
-    hits = predicate_hits(connection, blob if isinstance(blob, bytes) else None)
-    return tuple(hit.text for hit in hits)
-
-
-def _event_steps(
-    connection: sqlite3.Connection, schema: StoreSchema, trigger_pk: int
-) -> tuple[Step, ...]:
-    rows = connection.execute(
-        """
-        SELECT e.Z_ENT AS entity_id,
-               COALESCE(NULLIF(acc.ZCONFIGUREDNAME, ''), acc.ZPROVIDEDNAME) AS accessory,
-               COALESCE(NULLIF(s.ZEXPECTEDCONFIGUREDNAME, ''), s.ZNAME) AS service,
-               c.ZMANUFACTURERDESCRIPTION AS characteristic
-        FROM ZMKFEVENT e
-        LEFT JOIN ZMKFSERVICE s ON s.Z_PK = e.ZSERVICE
-        LEFT JOIN ZMKFCHARACTERISTIC c
-          ON c.ZSERVICE = e.ZSERVICE AND c.ZINSTANCEID = e.ZCHARACTERISTICID
-        LEFT JOIN ZMKFACCESSORY acc ON acc.Z_PK = s.ZACCESSORY
-        WHERE e.ZTRIGGER = ?
-        """,
-        (trigger_pk,),
-    ).fetchall()
-    return tuple(_step(row, schema, "event") for row in rows)
-
-
-def _action_steps(
-    connection: sqlite3.Connection, schema: StoreSchema, trigger_pk: int
-) -> tuple[Step, ...]:
-    junction = quote_ident(schema.junction)
-    action_column = quote_ident(schema.action_column)
-    trigger_column = quote_ident(schema.trigger_column)
-    rows = connection.execute(
-        f"""
-        SELECT a.Z_ENT AS entity_id,
-               COALESCE(
-                   NULLIF(acc.ZCONFIGUREDNAME, ''), acc.ZPROVIDEDNAME
-               ) AS accessory,
-               COALESCE(NULLIF(s.ZEXPECTEDCONFIGUREDNAME, ''), s.ZNAME) AS service,
-               c.ZMANUFACTURERDESCRIPTION AS characteristic,
-               c.ZFORMAT AS format,
-               c.ZUNITS AS units,
-               a.ZTARGETVALUE AS target,
-               a.ZNATURALLIGHTINGENABLEDFIELD AS lighting
-        FROM {junction} jt
-        JOIN ZMKFACTION a ON a.ZACTIONSET = jt.{action_column}
-        LEFT JOIN ZMKFACCESSORY acc
-          ON acc.Z_PK = COALESCE(a.ZACCESSORY1, a.ZACCESSORY2, a.ZACCESSORY)
-        LEFT JOIN ZMKFSERVICE s ON s.Z_PK = a.ZSERVICE
-        LEFT JOIN ZMKFCHARACTERISTIC c
-          ON c.ZSERVICE = a.ZSERVICE AND c.ZINSTANCEID = a.ZCHARACTERISTICID
-        WHERE jt.{trigger_column} = ?
-        """,
-        (trigger_pk,),
-    ).fetchall()
-    return tuple(_step(row, schema, "action", with_target=True) for row in rows)
-
-
-def _set_steps(
-    connection: sqlite3.Connection, schema: StoreSchema, action_set_pk: int
-) -> tuple[Step, ...]:
-    rows = connection.execute(
-        """
-        SELECT a.Z_ENT AS entity_id,
-               COALESCE(
-                   NULLIF(acc.ZCONFIGUREDNAME, ''), acc.ZPROVIDEDNAME
-               ) AS accessory,
-               COALESCE(NULLIF(s.ZEXPECTEDCONFIGUREDNAME, ''), s.ZNAME) AS service,
-               c.ZMANUFACTURERDESCRIPTION AS characteristic,
-               c.ZFORMAT AS format,
-               c.ZUNITS AS units,
-               a.ZTARGETVALUE AS target,
-               a.ZNATURALLIGHTINGENABLEDFIELD AS lighting
-        FROM ZMKFACTION a
-        LEFT JOIN ZMKFACCESSORY acc
-          ON acc.Z_PK = COALESCE(a.ZACCESSORY1, a.ZACCESSORY2, a.ZACCESSORY)
-        LEFT JOIN ZMKFSERVICE s ON s.Z_PK = a.ZSERVICE
-        LEFT JOIN ZMKFCHARACTERISTIC c
-          ON c.ZSERVICE = a.ZSERVICE AND c.ZINSTANCEID = a.ZCHARACTERISTICID
-        WHERE a.ZACTIONSET = ?
-        """,
-        (action_set_pk,),
-    ).fetchall()
-    return tuple(_step(row, schema, "action", with_target=True) for row in rows)
-
-
-def _automations_for_set(
-    connection: sqlite3.Connection, schema: StoreSchema, action_set_pk: int
-) -> tuple[str, ...]:
-    junction = quote_ident(schema.junction)
-    action_column = quote_ident(schema.action_column)
-    trigger_column = quote_ident(schema.trigger_column)
-    rows = connection.execute(
-        f"""
-        SELECT COALESCE(NULLIF(t.ZCONFIGUREDNAME, ''), t.ZNAME, '(unnamed)') AS label
-        FROM {junction} jt
-        JOIN ZMKFTRIGGER t ON t.Z_PK = jt.{trigger_column}
-        WHERE jt.{action_column} = ?
-        ORDER BY label
-        """,
-        (action_set_pk,),
-    ).fetchall()
-    return tuple(str(row["label"]) for row in rows)
-
-
-def _step(
-    row: sqlite3.Row, schema: StoreSchema, group: str, *, with_target: bool = False
-) -> Step:
-    entity = int(row["entity_id"]) if row["entity_id"] is not None else None
-    kind = schema.label(group, entity) if entity is not None else group
-    target = None
-    if kind == "adaptive lighting" and "lighting" in row.keys():
-        target = "on" if row["lighting"] else "off"
-    elif with_target and "target" in row.keys():
-        fmt = row["format"] if "format" in row.keys() else None
-        units = row["units"] if "units" in row.keys() else None
-        target = decode_target(row["target"], fmt, units)
-    return Step(
-        accessory=text_or_none(row["accessory"]),
-        service=text_or_none(row["service"]),
-        characteristic=text_or_none(row["characteristic"]),
-        target=target,
-        kind=kind,
-    )
-
