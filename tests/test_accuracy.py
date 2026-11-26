@@ -25,36 +25,11 @@ from homekit_map.extract import write_catalog
 from homekit_map.gaps import format_unused
 from homekit_map.predicate import predicate_hits
 from homekit_map.schema import ACTION_CLASS_LABELS, EVENT_CLASS_LABELS, TRIGGER_CLASS_LABELS, open_readonly
-from tests.fixture import build_store
+from tests.fixture import archive, build_store, compound, kind
 
 LESS_THAN = 0
 EQUAL_TO = 4
 NOT, AND, OR = 0, 1, 2
-
-
-def archive(root: object) -> bytes:
-    """Encode nested dicts and lists the way NSKeyedArchiver stores objects."""
-    objects: list[object] = ["$null"]
-
-    def add(value: object) -> object:
-        if isinstance(value, dict):
-            index = len(objects)
-            objects.append(None)
-            objects[index] = {key: add(item) for key, item in value.items()}
-            return plistlib.UID(index)
-        if isinstance(value, list):
-            return [add(item) for item in value]
-        return value
-
-    top = add(root)
-    return plistlib.dumps(
-        {"$version": 100000, "$archiver": "NSKeyedArchiver", "$top": {"root": top}, "$objects": objects},
-        fmt=plistlib.FMT_BINARY,
-    )
-
-
-def kind(name: str) -> dict:
-    return {"$classname": name}
 
 
 def characteristic_test(operator: int, value: object) -> list[dict]:
@@ -74,10 +49,6 @@ def characteristic_test(operator: int, value: object) -> list[dict]:
             "NSPredicateOperator": {"NSOperatorType": operator},
         },
     ]
-
-
-def compound(compound_type: int, parts: list[dict]) -> dict:
-    return {"$class": kind("NSCompoundPredicate"), "NSCompoundPredicateType": compound_type, "NSSubpredicates": parts}
 
 
 def texts(blob: bytes) -> list[str]:

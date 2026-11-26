@@ -6,34 +6,40 @@
 """Answer which automations and scenes use an accessory.
 
 Reads the snapshot only. A renamed accessory matches either its current
-HomeKit name or the name it was given originally.
+HomeKit name, the name it was given originally, or the name of any tile.
 """
 
 from __future__ import annotations
 
+import plistlib
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, replace
+from xml.parsers.expat import ExpatError
 
-from homekit_map.day import trigger_headings
-from homekit_map.decode import decode_target
-from homekit_map.predicate import PredicateHit, predicate_hits
-from homekit_map.schema import (
-    StoreSchema,
-    column_exists,
-    is_active,
-    load_schema,
-    quote_ident,
-    table_columns,
-    table_exists,
-    text_or_none,
-)
-
-_USER_SCENE = "HMActionSetTypeUserDefined"
+from homekit_map.events import Event
+from homekit_map.model import Action, Model, load_model
+from homekit_map.names import Names, load_names
+from homekit_map.schema import TRIGGER_CLASS_LABELS, column_or_null, quote_ident, table_columns, text_or_none
 
 _CAMERA_BULLETINS = {
-    "MKFCameraAccessModeBulletinRegistration": ("ZACCESSORY1", "camera access mode"),
-    "MKFCameraReachabilityBulletinRegistration": ("ZACCESSORY2", "camera reachability"),
-    "MKFCameraSignificantEventBulletinRegistration": ("ZACCESSORY3", "camera activity"),
+    "MKFCameraAccessModeBulletinRegistration": "camera access mode",
+    "MKFCameraReachabilityBulletinRegistration": "camera reachability",
+    "MKFCameraSignificantEventBulletinRegistration": "camera activity",
+}
+# CoreData gives each kind of registration its own accessory column, numbered per store.
+_BULLETIN_ACCESSORY_COLUMNS = ("ZACCESSORY", "ZACCESSORY1", "ZACCESSORY2", "ZACCESSORY3")
+# On an accessory, more than this many triggers that read the same become one line with a count.
+_GROUPED_TRIGGERS = 3
+_TRIGGER_ROLES = frozenset(TRIGGER_CLASS_LABELS.values())
+_ROLE_ORDER = {
+    "trigger": 0,
+    "condition": 1,
+    "action": 3,
+    "adaptive lighting": 4,
+    "media playback": 5,
+    "shortcut": 6,
+    "turn off": 7,
 }
 
 
@@ -72,6 +78,7 @@ class Accessory:
     triggers: tuple[Use, ...]
     notifications: tuple[str, ...] = ()
     conditions: tuple[Use, ...] = ()
+    bridged: int = 0
 
     @property
     def display_name(self) -> str:
@@ -87,34 +94,29 @@ class Accessory:
         ]
         return tuple(value for value in values if value)
 
-
-@dataclass(frozen=True)
-class _Condition:
-    trigger_pk: int
-    name: str
-    enabled: bool
-    hits: tuple[PredicateHit, ...]
+    def own_names(self) -> tuple[str, ...]:
+        """Names of the accessory and its tiles, without the maker or model."""
+        values = [self.configured_name, self.provided_name, *self.services]
+        return tuple(value for value in values if value)
 
 
 @dataclass(frozen=True)
 class _Shortcut:
-    data: bytes
-    trigger_pk: int | None
-    name: str
-    enabled: bool | None
+    text: str
+    set_pk: int
 
 
 @dataclass(frozen=True)
 class _Context:
     """What every accessory lookup needs, read once per command."""
 
-    schema: StoreSchema
-    known_names: tuple[bytes, ...]
-    headings: dict[int, str]
-    conditions: tuple[_Condition, ...]
+    model: Model
+    known_names: tuple[str, ...]
     shortcuts: tuple[_Shortcut, ...]
     writers: dict[int, tuple[tuple[int, str], ...]]
+    by_accessory: dict[int, tuple[Action, ...]]
     bulletin_columns: frozenset[str]
+    camera_columns: dict[int, str]
 
 
 def find_accessories(
@@ -124,19 +126,26 @@ def find_accessories(
     needle = text.casefold().strip()
     if not needle:
         return []
+    names = load_names(connection)
     matched = [
-        item for item in _load_accessories(connection) if _matches(item, needle, scope)
+        item for item in _load_accessories(connection, names) if _matches(item, needle, scope)
     ]
     if not matched:
         return []
-    context = _load_context(connection)
+    context = _load_context(connection, names)
     return [_with_uses(connection, context, item) for item in matched]
 
 
 def all_accessories(connection: sqlite3.Connection) -> list[Accessory]:
     """Return every accessory, including ones no automation uses."""
-    context = _load_context(connection)
-    return [_with_uses(connection, context, item) for item in _load_accessories(connection)]
+    return accessories_and_model(connection)[0]
+
+
+def accessories_and_model(connection: sqlite3.Connection) -> tuple[list[Accessory], Model]:
+    """Every accessory with its uses, and the model they were read from."""
+    names = load_names(connection)
+    context = _load_context(connection, names)
+    return [_with_uses(connection, context, item) for item in _load_accessories(connection, names)], context.model
 
 
 def format_accessories(items: list[Accessory]) -> str:
@@ -154,6 +163,12 @@ def format_accessories(items: list[Accessory]) -> str:
         device = " ".join(part for part in (item.manufacturer, item.model) if part)
         if device:
             lines.append(f"  device: {device}")
+        if item.bridged:
+            lines.append(f"  bridge: {item.bridged} {'accessory' if item.bridged == 1 else 'accessories'}")
+        tiles = [name for name in item.services if name != item.display_name]
+        if tiles:
+            lines.append("  services:")
+            lines.extend(f"    {name}" for name in tiles)
         _append_uses(lines, "automations", item.automations)
         _append_uses(lines, "scenes", item.scenes)
         _append_uses(lines, "triggers", item.triggers)
@@ -165,12 +180,24 @@ def format_accessories(items: list[Accessory]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def trigger_texts(starts: tuple[Event, ...]) -> tuple[str, ...]:
+    """What starts an automation. Many accessories that test the same thing share one line."""
+    counts = Counter(event.detail for event in starts if event.accessory_pk is not None)
+    texts: list[str] = []
+    for event in starts:
+        count = counts[event.detail] if event.accessory_pk is not None else 0
+        text = f"{event.detail}  ({count} accessories)" if count > _GROUPED_TRIGGERS else event.text
+        if text not in texts:
+            texts.append(text)
+    return tuple(texts)
+
+
 def _matches(item: Accessory, needle: str, scope: str | None = None) -> bool:
     fields: tuple[str | None, ...]
     if scope == "maker":
         fields = (item.manufacturer, item.model)
     elif scope == "accessory":
-        fields = (item.configured_name, item.provided_name, *item.services)
+        fields = item.own_names()
     else:
         fields = item.match_names()
     return any(needle in name.casefold() for name in fields if name)
@@ -203,25 +230,22 @@ def _use_heading(use: Use) -> str:
 
 
 def _use_order(use: Use) -> int:
-    """Eve's order: what starts it, the test, then the scene or accessories."""
-    return {
-        "trigger": 0,
-        "condition": 1,
-        "scene": 2,
-        "action": 3,
-        "adaptive lighting": 4,
-        "shortcut": 5,
-    }.get(use.role, 9)
+    """Eve's order: what starts it, the test, then the scene or accessories, then when it turns off."""
+    if use.scene and use.role not in ("trigger", "condition", "turn off"):
+        return 2
+    return _ROLE_ORDER.get(use.role, 6)
 
 
 def _use_detail(use: Use) -> str:
-    if use.role == "trigger":
-        return f"trigger  {use.target}" if use.target else "trigger"
-    if use.role == "condition":
-        return f"condition  {use.target}" if use.target else "condition"
+    if use.role in ("trigger", "condition", "turn off"):
+        return f"{use.role}  {use.target}" if use.target else use.role
+    if use.role in _TRIGGER_ROLES:
+        text = use.target or use.role
+        return f"{text}  service={use.service}" if use.service else text
+    lead = [f"scene {use.scene}"] if use.scene else []
     if use.role == "adaptive lighting":
-        return f"adaptive lighting {use.target or 'off'}"
-    parts = [f"scene {use.scene}" if use.role == "scene" and use.scene else use.role]
+        return "  ".join([*lead, f"adaptive lighting {use.target or 'off'}"])
+    parts = [*lead, use.role] if not lead or use.role != "action" else lead
     if use.service:
         parts.append(f"service={use.service}")
     if use.characteristic:
@@ -231,7 +255,7 @@ def _use_detail(use: Use) -> str:
     return "  ".join(parts)
 
 
-def _load_accessories(connection: sqlite3.Connection) -> list[Accessory]:
+def _load_accessories(connection: sqlite3.Connection, names: Names) -> list[Accessory]:
     rows = connection.execute(
         """
         SELECT a.Z_PK, a.ZCONFIGUREDNAME, a.ZPROVIDEDNAME, a.ZMANUFACTURER, a.ZMODEL,
@@ -241,7 +265,6 @@ def _load_accessories(connection: sqlite3.Connection) -> list[Accessory]:
         ORDER BY COALESCE(NULLIF(a.ZCONFIGUREDNAME, ''), a.ZPROVIDEDNAME, '')
         """
     ).fetchall()
-    services = _services_by_accessory(connection)
     return [
         Accessory(
             pk=int(row["Z_PK"]),
@@ -250,243 +273,190 @@ def _load_accessories(connection: sqlite3.Connection) -> list[Accessory]:
             manufacturer=text_or_none(row["ZMANUFACTURER"]),
             model=text_or_none(row["ZMODEL"]),
             room=text_or_none(row["room"]),
-            services=services.get(int(row["Z_PK"]), ()),
+            services=names.tile_names(int(row["Z_PK"])),
             automations=(),
             scenes=(),
             triggers=(),
+            bridged=names.hosted.get(int(row["Z_PK"]), 0),
         )
         for row in rows
     ]
 
 
-def _services_by_accessory(connection: sqlite3.Connection) -> dict[int, tuple[str, ...]]:
-    grouped: dict[int, list[str]] = {}
-    rows = connection.execute(
-        """
-        SELECT ZACCESSORY, ZNAME, ZEXPECTEDCONFIGUREDNAME
-        FROM ZMKFSERVICE
-        WHERE ZACCESSORY IS NOT NULL
-        """
-    ).fetchall()
-    for row in rows:
-        name = text_or_none(row["ZEXPECTEDCONFIGUREDNAME"]) or text_or_none(row["ZNAME"])
-        if not name:
+def _load_context(connection: sqlite3.Connection, names: Names) -> _Context:
+    model = load_model(connection, names)
+    writers: dict[int, list[tuple[int, str]]] = {}
+    by_accessory: dict[int, list[Action]] = {}
+    shortcuts: list[_Shortcut] = []
+    for action in model.actions:
+        if action.accessory_pk is not None:
+            by_accessory.setdefault(action.accessory_pk, []).append(action)
+        if action.role == "shortcut" and action.data:
+            shortcuts.append(_Shortcut(_shortcut_text(action.data), action.set_pk))
+        action_set = model.sets.get(action.set_pk)
+        if action_set is None or action.accessory_pk is None or not action.tile:
             continue
-        names = grouped.setdefault(int(row["ZACCESSORY"]), [])
-        if name not in names:
-            names.append(name)
-    return {pk: tuple(names) for pk, names in grouped.items()}
-
-
-def _load_context(connection: sqlite3.Connection) -> _Context:
-    schema = load_schema(connection)
-    bulletins = (
-        frozenset(table_columns(connection, "ZMKFBULLETINREGISTRATION"))
-        if table_exists(connection, "ZMKFBULLETINREGISTRATION")
-        else frozenset()
-    )
+        for trigger_pk in action_set.triggers:
+            writers.setdefault(trigger_pk, []).append((action.accessory_pk, action.tile))
+    bulletins = frozenset(table_columns(connection, "ZMKFBULLETINREGISTRATION"))
     return _Context(
-        schema=schema,
+        model=model,
         known_names=_known_names(connection),
-        headings=trigger_headings(connection),
-        conditions=_load_conditions(connection),
-        shortcuts=_load_shortcuts(connection, schema),
-        writers=_load_writers(connection, schema),
+        shortcuts=tuple(shortcuts),
+        writers={pk: tuple(items) for pk, items in writers.items()},
+        by_accessory={pk: tuple(items) for pk, items in by_accessory.items()},
         bulletin_columns=bulletins,
+        camera_columns=_camera_columns(connection, model, bulletins),
     )
 
 
 def _with_uses(connection: sqlite3.Connection, context: _Context, item: Accessory) -> Accessory:
-    automations, scenes = _action_uses(connection, context, item.pk)
+    automations, scenes = _action_uses(context, item.pk)
     shortcut_automations, shortcut_scenes = _shortcut_mentions(context, item)
     automations = _dedupe(automations + shortcut_automations + _condition_uses(context, item.pk))
     return replace(
         item,
-        automations=_with_trigger_lines(context, automations),
+        automations=_with_automation_lines(context, automations, item.pk),
         scenes=_dedupe(scenes + shortcut_scenes),
-        triggers=_trigger_uses(connection, context, item.pk),
+        triggers=_trigger_uses(context, item),
         notifications=_notifications(connection, context, item.pk),
     )
 
 
 def _companions(context: _Context, trigger_pk: int | None, accessory_pk: int) -> tuple[str, ...]:
-    """Other accessories the same automation writes."""
+    """Other accessories the same automation writes, by the name of the tile it writes."""
     if trigger_pk is None:
         return ()
     labels = {label for pk, label in context.writers.get(trigger_pk, ()) if pk != accessory_pk}
     return tuple(sorted(labels))
 
 
-def _load_writers(connection: sqlite3.Connection, schema: StoreSchema) -> dict[int, tuple[tuple[int, str], ...]]:
-    junction = quote_ident(schema.junction)
-    action_column = quote_ident(schema.action_column)
-    trigger_column = quote_ident(schema.trigger_column)
-    rows = connection.execute(
-        f"""
-        SELECT DISTINCT jt.{trigger_column} AS trigger_pk,
-               acc.Z_PK AS accessory_pk,
-               COALESCE(NULLIF(acc.ZCONFIGUREDNAME, ''), acc.ZPROVIDEDNAME) AS label
-        FROM ZMKFACTION a
-        JOIN ZMKFACCESSORY acc
-          ON acc.Z_PK = COALESCE(a.ZACCESSORY1, a.ZACCESSORY2, a.ZACCESSORY)
-        JOIN {junction} jt ON jt.{action_column} = a.ZACTIONSET
-        """
-    ).fetchall()
-    grouped: dict[int, list[tuple[int, str]]] = {}
-    for row in rows:
-        if row["trigger_pk"] is None or not row["label"]:
-            continue
-        grouped.setdefault(int(row["trigger_pk"]), []).append((int(row["accessory_pk"]), str(row["label"])))
-    return {pk: tuple(items) for pk, items in grouped.items()}
-
-
-def _load_conditions(connection: sqlite3.Connection) -> tuple[_Condition, ...]:
-    if not column_exists(connection, "ZMKFTRIGGER", "ZEVALUATIONCONDITION"):
-        return ()
-    rows = connection.execute(
-        """
-        SELECT Z_PK, ZCONFIGUREDNAME, ZNAME, ZACTIVE, ZEVALUATIONCONDITION
-        FROM ZMKFTRIGGER
-        WHERE ZEVALUATIONCONDITION IS NOT NULL
-        """
-    ).fetchall()
-    found: list[_Condition] = []
-    for row in rows:
-        blob = row["ZEVALUATIONCONDITION"]
-        hits = predicate_hits(connection, blob if isinstance(blob, bytes) else None)
-        if hits:
-            found.append(
-                _Condition(
-                    trigger_pk=int(row["Z_PK"]),
-                    name=_trigger_label(row["ZCONFIGUREDNAME"], row["ZNAME"]),
-                    enabled=is_active(row["ZACTIVE"]),
-                    hits=hits,
-                )
-            )
-    return tuple(found)
-
-
-def _condition_uses(context: _Context, accessory_pk: int) -> tuple[Use, ...]:
-    return tuple(
-        Use(
-            role="condition",
-            name=condition.name,
-            enabled=condition.enabled,
-            service=None,
-            characteristic=None,
-            target=hit.detail,
-            also=_companions(context, condition.trigger_pk, accessory_pk),
-            automation_pk=condition.trigger_pk,
-        )
-        for condition in context.conditions
-        for hit in condition.hits
-        if hit.accessory_pk == accessory_pk
-    )
-
-
-def _with_trigger_lines(context: _Context, uses: tuple[Use, ...]) -> tuple[Use, ...]:
-    """Put the start of each automation on that automation."""
-    seen: set[int] = set()
-    extra: list[Use] = []
-    for use in uses:
-        if use.automation_pk is None or use.automation_pk in seen:
-            continue
-        heading = context.headings.get(use.automation_pk)
-        if heading is None:
-            continue
-        seen.add(use.automation_pk)
-        extra.append(
-            Use(
-                role="trigger",
-                name=use.name,
-                enabled=use.enabled,
-                service=None,
-                characteristic=None,
-                target=heading,
-                automation_pk=use.automation_pk,
-            )
-        )
-    return tuple(extra) + uses
-
-
-def _action_uses(
-    connection: sqlite3.Connection, context: _Context, accessory_pk: int
-) -> tuple[tuple[Use, ...], tuple[Use, ...]]:
-    schema = context.schema
-    junction = quote_ident(schema.junction)
-    action_column = quote_ident(schema.action_column)
-    trigger_column = quote_ident(schema.trigger_column)
-    rows = connection.execute(
-        f"""
-        SELECT t.Z_PK AS trigger_pk,
-               t.ZCONFIGUREDNAME AS trigger_configured,
-               t.ZNAME AS trigger_name,
-               t.ZACTIVE AS active,
-               aset.ZNAME AS set_name,
-               aset.ZTYPE AS set_type,
-               s.ZNAME AS service_name,
-               s.ZEXPECTEDCONFIGUREDNAME AS service_configured,
-               c.ZMANUFACTURERDESCRIPTION AS characteristic,
-               c.ZFORMAT AS format,
-               c.ZUNITS AS units,
-               a.ZTARGETVALUE AS target,
-               a.Z_ENT AS entity_id,
-               a.ZNATURALLIGHTINGENABLEDFIELD AS lighting
-        FROM ZMKFACTION a
-        LEFT JOIN ZMKFSERVICE s ON s.Z_PK = a.ZSERVICE
-        LEFT JOIN ZMKFCHARACTERISTIC c
-          ON c.ZSERVICE = a.ZSERVICE AND c.ZINSTANCEID = a.ZCHARACTERISTICID
-        JOIN ZMKFACTIONSET aset ON aset.Z_PK = a.ZACTIONSET
-        LEFT JOIN {junction} jt ON jt.{action_column} = aset.Z_PK
-        LEFT JOIN ZMKFTRIGGER t ON t.Z_PK = jt.{trigger_column}
-        WHERE a.ZACCESSORY1 = ? OR a.ZACCESSORY2 = ? OR a.ZACCESSORY = ? OR s.ZACCESSORY = ?
-        """,
-        (accessory_pk, accessory_pk, accessory_pk, accessory_pk),
-    ).fetchall()
+def _placed(context: _Context, set_pk: int, use: Use, accessory_pk: int | None) -> tuple[list[Use], list[Use]]:
+    """Put one use on its scene, and on every automation that runs its action set."""
+    model = context.model
+    action_set = model.sets.get(set_pk)
     automations: list[Use] = []
     scenes: list[Use] = []
-    for row in rows:
-        write = _write_use(row, schema)
-        set_name = text_or_none(row["set_name"]) or "(unnamed)"
-        is_scene = row["set_type"] == _USER_SCENE
-        trigger_pk = row["trigger_pk"]
-        if is_scene or trigger_pk is None:
-            scenes.append(replace(write, name=set_name))
-        if trigger_pk is not None:
-            automations.append(
-                replace(
-                    write,
-                    role="scene" if is_scene else write.role,
-                    name=_trigger_label(row["trigger_configured"], row["trigger_name"]),
-                    enabled=is_active(row["active"]),
-                    also=_companions(context, int(trigger_pk), accessory_pk),
-                    automation_pk=int(trigger_pk),
-                    scene=set_name if is_scene else None,
-                )
+    if action_set is None:
+        return automations, scenes
+    scene = (action_set.name or "(unnamed)") if action_set.is_scene else None
+    if scene is not None:
+        scenes.append(replace(use, name=scene))
+    for trigger_pk in action_set.triggers:
+        trigger = model.triggers.get(trigger_pk)
+        if trigger is None:
+            continue
+        automations.append(
+            replace(
+                use,
+                name=trigger.label,
+                enabled=trigger.enabled,
+                also=_companions(context, trigger_pk, accessory_pk) if accessory_pk is not None else (),
+                automation_pk=trigger_pk,
+                scene=scene,
             )
+        )
+    return automations, scenes
+
+
+def _action_uses(context: _Context, accessory_pk: int) -> tuple[tuple[Use, ...], tuple[Use, ...]]:
+    automations: list[Use] = []
+    scenes: list[Use] = []
+    for action in context.by_accessory.get(accessory_pk, ()):
+        placed_automations, placed_scenes = _placed(context, action.set_pk, _write_use(action), accessory_pk)
+        automations.extend(placed_automations)
+        scenes.extend(placed_scenes)
     return _dedupe(tuple(automations)), _dedupe(tuple(scenes))
 
 
-def _write_use(row: sqlite3.Row, schema: StoreSchema) -> Use:
+def _write_use(action: Action) -> Use:
     """The write itself, before it is placed on an automation or a scene."""
-    lighting = schema.label("action", int(row["entity_id"])) == "adaptive lighting"
-    if lighting:
-        return Use(
-            role="adaptive lighting",
-            name="",
-            enabled=None,
-            service=None,
-            characteristic=None,
-            target="on" if row["lighting"] else "off",
-        )
+    if action.role == "adaptive lighting":
+        return Use(role=action.role, name="", enabled=None, service=None, characteristic=None, target=action.target)
     return Use(
-        role="action",
+        role=action.role,
         name="",
         enabled=None,
-        service=text_or_none(row["service_configured"]) or text_or_none(row["service_name"]),
-        characteristic=text_or_none(row["characteristic"]),
-        target=decode_target(row["target"], text_or_none(row["format"]), text_or_none(row["units"])),
+        service=action.service,
+        characteristic=action.characteristic,
+        target=action.target,
     )
+
+
+def _condition_uses(context: _Context, accessory_pk: int) -> tuple[Use, ...]:
+    model = context.model
+    found: list[Use] = []
+    for trigger_pk, hits in model.conditions.items():
+        trigger = model.triggers.get(trigger_pk)
+        if trigger is None:
+            continue
+        found.extend(
+            Use(
+                role="condition",
+                name=trigger.label,
+                enabled=trigger.enabled,
+                service=None,
+                characteristic=None,
+                target=hit.detail,
+                also=_companions(context, trigger_pk, accessory_pk),
+                automation_pk=trigger_pk,
+            )
+            for hit in hits
+            if hit.accessory_pk == accessory_pk
+        )
+    return tuple(found)
+
+
+def _with_automation_lines(context: _Context, uses: tuple[Use, ...], accessory_pk: int) -> tuple[Use, ...]:
+    """Put each automation's triggers, other conditions, and Turn Off setting on that automation."""
+    model = context.model
+    seen: set[int] = set()
+    extra: list[Use] = []
+    for use in uses:
+        pk = use.automation_pk
+        if pk is None or pk in seen:
+            continue
+        seen.add(pk)
+
+        def line(role: str, target: str, source: Use = use, trigger_pk: int = pk) -> Use:
+            return Use(
+                role=role,
+                name=source.name,
+                enabled=source.enabled,
+                service=None,
+                characteristic=None,
+                target=target,
+                automation_pk=trigger_pk,
+            )
+
+        extra.extend(line("trigger", text) for text in trigger_texts(model.starts(pk)) or ("none",))
+        extra.extend(line("condition", hit.text) for hit in model.conditions.get(pk, ()) if hit.accessory_pk != accessory_pk)
+        extra.extend(line("turn off", event.text) for event in model.ends(pk))
+    return tuple(extra) + uses
+
+
+def _trigger_uses(context: _Context, item: Accessory) -> tuple[Use, ...]:
+    """Automations this accessory starts, or turns off."""
+    model = context.model
+    found: list[Use] = []
+    for event in model.events:
+        if event.accessory_pk != item.pk:
+            continue
+        trigger = model.triggers.get(event.trigger_pk)
+        prefix = "turns off when" if event.end else "when"
+        service = event.service if event.service and event.service != item.display_name else None
+        found.append(
+            Use(
+                role=trigger.kind if trigger else "event",
+                name=event.automation,
+                enabled=event.enabled,
+                service=service,
+                characteristic=None,
+                target=f"{prefix} {event.detail}",
+                automation_pk=event.trigger_pk,
+            )
+        )
+    return _dedupe(tuple(found))
 
 
 def _notifications(connection: sqlite3.Connection, context: _Context, accessory_pk: int) -> tuple[str, ...]:
@@ -509,9 +479,10 @@ def _notifications(connection: sqlite3.Connection, context: _Context, accessory_
             label = text_or_none(row["characteristic"]) or "characteristic"
             if label not in found:
                 found.append(label)
-    for class_name, (column, label) in _CAMERA_BULLETINS.items():
-        entity = context.schema.classes.get(class_name)
-        if entity is None or column not in columns:
+    for class_name, label in _CAMERA_BULLETINS.items():
+        entity = context.model.schema.classes.get(class_name)
+        column = context.camera_columns.get(entity) if entity is not None else None
+        if column is None:
             continue
         row = connection.execute(
             f"""
@@ -525,130 +496,92 @@ def _notifications(connection: sqlite3.Connection, context: _Context, accessory_
     return tuple(found)
 
 
-def _trigger_uses(connection: sqlite3.Connection, context: _Context, accessory_pk: int) -> tuple[Use, ...]:
-    rows = connection.execute(
-        """
-        SELECT t.Z_PK AS trigger_pk,
-               t.ZCONFIGUREDNAME AS trigger_configured,
-               t.ZNAME AS trigger_name,
-               t.ZACTIVE AS active,
-               t.Z_ENT AS entity_id,
-               s.ZNAME AS service_name,
-               s.ZEXPECTEDCONFIGUREDNAME AS service_configured,
-               c.ZMANUFACTURERDESCRIPTION AS characteristic
-        FROM ZMKFEVENT e
-        JOIN ZMKFTRIGGER t ON t.Z_PK = e.ZTRIGGER
-        LEFT JOIN ZMKFCHARACTERISTIC c
-          ON c.ZSERVICE = e.ZSERVICE AND c.ZINSTANCEID = e.ZCHARACTERISTICID
-        LEFT JOIN ZMKFSERVICE s ON s.Z_PK = e.ZSERVICE
-        WHERE s.ZACCESSORY = ?
-        """,
-        (accessory_pk,),
-    ).fetchall()
-    found = [
-        Use(
-            role=context.schema.label("trigger", int(row["entity_id"])),
-            name=_trigger_label(row["trigger_configured"], row["trigger_name"]),
-            enabled=is_active(row["active"]),
-            service=text_or_none(row["service_configured"]) or text_or_none(row["service_name"]),
-            characteristic=text_or_none(row["characteristic"]),
-            target=None,
-            automation_pk=int(row["trigger_pk"]),
-        )
-        for row in rows
-    ]
-    return _dedupe(tuple(found))
-
-
-def _load_shortcuts(connection: sqlite3.Connection, schema: StoreSchema) -> tuple[_Shortcut, ...]:
-    shortcut_entity = schema.classes.get("MKFShortcutAction")
-    if shortcut_entity is None:
-        return ()
-    junction = quote_ident(schema.junction)
-    action_column = quote_ident(schema.action_column)
-    trigger_column = quote_ident(schema.trigger_column)
-    rows = connection.execute(
-        f"""
-        SELECT a.ZDATA AS data,
-               t.Z_PK AS trigger_pk,
-               t.ZCONFIGUREDNAME AS trigger_configured,
-               t.ZNAME AS trigger_name,
-               t.ZACTIVE AS active,
-               aset.ZNAME AS set_name
-        FROM ZMKFACTION a
-        JOIN ZMKFACTIONSET aset ON aset.Z_PK = a.ZACTIONSET
-        LEFT JOIN {junction} jt ON jt.{action_column} = aset.Z_PK
-        LEFT JOIN ZMKFTRIGGER t ON t.Z_PK = jt.{trigger_column}
-        WHERE a.Z_ENT = ? AND a.ZDATA IS NOT NULL
-        """,
-        (shortcut_entity,),
-    ).fetchall()
-    found: list[_Shortcut] = []
-    for row in rows:
-        if not isinstance(row["data"], bytes):
+def _camera_columns(connection: sqlite3.Connection, model: Model, columns: frozenset[str]) -> dict[int, str]:
+    """For each camera registration type, the accessory column its rows fill in this store."""
+    found: dict[int, str] = {}
+    for class_name in _CAMERA_BULLETINS:
+        entity = model.schema.classes.get(class_name)
+        if entity is None:
             continue
-        linked = row["trigger_pk"] is not None
-        found.append(
-            _Shortcut(
-                data=row["data"],
-                trigger_pk=int(row["trigger_pk"]) if linked else None,
-                name=(
-                    _trigger_label(row["trigger_configured"], row["trigger_name"])
-                    if linked
-                    else text_or_none(row["set_name"]) or "(unnamed)"
-                ),
-                enabled=is_active(row["active"]) if linked else None,
-            )
-        )
-    return tuple(found)
+        for column in _BULLETIN_ACCESSORY_COLUMNS:
+            if column not in columns:
+                continue
+            row = connection.execute(
+                f"SELECT 1 FROM ZMKFBULLETINREGISTRATION WHERE Z_ENT = ? AND {quote_ident(column)} IS NOT NULL LIMIT 1",
+                (entity,),
+            ).fetchone()
+            if row is not None:
+                found[entity] = column
+                break
+    return found
 
 
 def _shortcut_mentions(context: _Context, item: Accessory) -> tuple[tuple[Use, ...], tuple[Use, ...]]:
-    names = [name.encode() for name in item.match_names()]
+    names = item.own_names()
     if not names or not context.shortcuts:
         return (), ()
     longer = {name: _longer_names(name, context.known_names) for name in names}
     automations: list[Use] = []
     scenes: list[Use] = []
     for shortcut in context.shortcuts:
-        if not any(_name_in_blob(shortcut.data, name, longer[name]) for name in names):
+        if not any(_name_in_text(shortcut.text, name, longer[name]) for name in names):
             continue
-        use = Use(
-            role="shortcut",
-            name=shortcut.name,
-            enabled=shortcut.enabled,
-            service=None,
-            characteristic=None,
-            target=None,
-            automation_pk=shortcut.trigger_pk,
-        )
-        (automations if shortcut.trigger_pk is not None else scenes).append(use)
+        use = Use(role="shortcut", name="", enabled=None, service=None, characteristic=None, target=None)
+        placed_automations, placed_scenes = _placed(context, shortcut.set_pk, use, None)
+        automations.extend(placed_automations)
+        scenes.extend(placed_scenes)
     return tuple(automations), tuple(scenes)
 
 
-def _longer_names(name: bytes, known: tuple[bytes, ...]) -> tuple[bytes, ...]:
+def _shortcut_text(data: bytes) -> str:
+    """The strings in a shortcut. A binary plist may store a name as UTF-16, so search the decoded text."""
+    try:
+        loaded = plistlib.loads(data)
+    except (ValueError, ExpatError):
+        return data.decode("utf-8", errors="replace")
+    strings: list[str] = []
+    _collect_strings(loaded, strings, 0)
+    return "\n".join(strings)
+
+
+def _collect_strings(node: object, found: list[str], depth: int) -> None:
+    if depth > 64:
+        return
+    if isinstance(node, str):
+        found.append(node)
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            _collect_strings(key, found, depth + 1)
+            _collect_strings(value, found, depth + 1)
+    elif isinstance(node, list | tuple):
+        for value in node:
+            _collect_strings(value, found, depth + 1)
+    elif isinstance(node, bytes) and node.startswith(b"bplist"):
+        try:
+            _collect_strings(plistlib.loads(node), found, depth + 1)
+        except (ValueError, ExpatError):
+            return
+
+
+def _longer_names(name: str, known: tuple[str, ...]) -> tuple[str, ...]:
     """Known names that begin with name, such as "Outlet A S1" for "Outlet A"."""
     return tuple(other for other in known if len(other) > len(name) and other.startswith(name))
 
 
-def _name_in_blob(payload: bytes, name: bytes, longer: tuple[bytes, ...] = ()) -> bool:
+def _name_in_text(text: str, name: str, longer: tuple[str, ...] = ()) -> bool:
     """True when name occurs on its own, not as the start of a longer known name."""
     start = 0
     while True:
-        index = payload.find(name, start)
+        index = text.find(name, start)
         if index < 0:
             return False
-        before_ok = index == 0 or not chr(payload[index - 1]).isalnum()
+        before_ok = index == 0 or not text[index - 1].isalnum()
         after = index + len(name)
-        after_ok = after >= len(payload) or not chr(payload[after]).isalnum()
-        covered = any(payload.startswith(extra, index) for extra in longer)
+        after_ok = after >= len(text) or not text[after].isalnum()
+        covered = any(text.startswith(extra, index) for extra in longer)
         if before_ok and after_ok and not covered:
             return True
         start = index + 1
-
-
-def _trigger_label(configured: object, name: object) -> str:
-    return text_or_none(configured) or text_or_none(name) or "(unnamed)"
 
 
 def _dedupe(uses: tuple[Use, ...]) -> tuple[Use, ...]:
@@ -658,10 +591,14 @@ def _dedupe(uses: tuple[Use, ...]) -> tuple[Use, ...]:
     )
 
 
-def _known_names(connection: sqlite3.Connection) -> tuple[bytes, ...]:
+def _known_names(connection: sqlite3.Connection) -> tuple[str, ...]:
     found: set[str] = set()
     for row in connection.execute("SELECT ZCONFIGUREDNAME, ZPROVIDEDNAME FROM ZMKFACCESSORY"):
         found.update(text for text in map(text_or_none, row) if text)
-    for row in connection.execute("SELECT ZNAME, ZEXPECTEDCONFIGUREDNAME FROM ZMKFSERVICE"):
+    columns = table_columns(connection, "ZMKFSERVICE")
+    service_names = ", ".join(
+        column_or_null(columns, "s", column) for column in ("ZNAME", "ZEXPECTEDCONFIGUREDNAME", "ZPROVIDEDNAME")
+    )
+    for row in connection.execute(f"SELECT {service_names} FROM ZMKFSERVICE s"):
         found.update(text for text in map(text_or_none, row) if text)
-    return tuple(name.encode() for name in found)
+    return tuple(sorted(found))

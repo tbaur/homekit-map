@@ -204,6 +204,7 @@ class QueryTests(unittest.TestCase):
             writable.execute(
                 "INSERT INTO ZMKFTRIGGER VALUES (4, 20, 'Retired', 'Retired', 0, 127)"
             )
+            writable.execute("INSERT INTO ZMKFACCESSORY VALUES (5, NULL, 'Sensor', NULL, NULL, 1)")
             writable.commit()
             writable.close()
             connection = open_readonly(database)
@@ -215,9 +216,11 @@ class QueryTests(unittest.TestCase):
                 connection.close()
             self.assertIn("10 minutes before sunset", day)
             self.assertIn("Evening", day)
-            self.assertIn("Outlet A S1", unused)
-            self.assertIn("Retired", unused)
-            self.assertIn("Away", unused)
+            self.assertIn("not in an automation or scene:\n  Sensor  room=Zone One\n", unused)
+            self.assertNotIn("Outlet A S1", unused)
+            self.assertIn("disabled automations:\n  Retired\n", unused)
+            self.assertIn("scenes with no automation:\n  Away\n", unused)
+            self.assertIn("automations that do nothing:\n  Retired  no trigger, no actions\n", unused)
             self.assertEqual(len(made), 4)
 
     def test_tuesday_hides_a_weekend_automation(self) -> None:
@@ -299,10 +302,8 @@ class QueryTests(unittest.TestCase):
             model = uuid.UUID("00000000-0000-0000-0000-000000000002")
             writable = sqlite3.connect(database)
             writable.execute("ALTER TABLE ZMKFACCESSORY ADD COLUMN ZMODELID BLOB")
-            writable.execute("ALTER TABLE ZMKFSERVICE ADD COLUMN ZINSTANCEID INTEGER")
             writable.execute("ALTER TABLE ZMKFTRIGGER ADD COLUMN ZEVALUATIONCONDITION BLOB")
             writable.execute("UPDATE ZMKFACCESSORY SET ZMODELID = ? WHERE Z_PK = 2", (model.bytes,))
-            writable.execute("UPDATE ZMKFSERVICE SET ZINSTANCEID = 9 WHERE Z_PK = 2")
             writable.execute(
                 "UPDATE ZMKFTRIGGER SET ZEVALUATIONCONDITION = ? WHERE Z_PK = 1",
                 (_false_power_condition(model),),
@@ -316,7 +317,9 @@ class QueryTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertIn("  condition:\n    Example Outlet  Power State is false", report)
-            self.assertIn("    Evening [enabled]\n      condition  Power State is false\n      action", accessory)
+            self.assertIn(
+                "    Evening [enabled]\n      trigger  16:00\n      condition  Power State is false\n      action", accessory
+            )
             self.assertNotIn("\n  conditions:\n", accessory)
 
     def test_actions_for_one_automation_share_a_heading(self) -> None:
@@ -356,8 +359,8 @@ class QueryTests(unittest.TestCase):
             self.assertEqual(by_name["Outlet A"].triggers[0].role, "event")
             self.assertEqual(by_name["Outlet A"].triggers[0].name, "Morning")
             self.assertEqual(by_name["Outlet A"].automations, ())
-            self.assertEqual(by_name["Outlet A S1"].automations[0].role, "shortcut")
-            self.assertEqual(by_name["Outlet A S1"].automations[0].name, "Morning")
+            shortcuts = [use for use in by_name["Outlet A S1"].automations if use.role == "shortcut"]
+            self.assertEqual([use.name for use in shortcuts], ["Morning"])
             self.assertEqual(by_name["Outlet A"].scenes, ())
 
     def test_catalog_omits_the_database_path(self) -> None:

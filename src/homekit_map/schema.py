@@ -21,12 +21,25 @@ from homekit_map.errors import SnapshotError
 from homekit_map.paths import LIVE_HOMEKIT_DIR, is_within
 
 ACTION_CLASS_LABELS = {
+    "MKFAppleMediaAccessoryPowerAction": "media power",
     "MKFCharacteristicWriteAction": "write",
     "MKFMatterCommandAction": "matter command",
     "MKFMediaPlaybackAction": "media playback",
     "MKFNaturalLightingAction": "adaptive lighting",
     "MKFShortcutAction": "shortcut",
 }
+
+TRIGGER_OWNED = "HMActionSetTypeTriggerOwned"
+USER_SCENE = "HMActionSetTypeUserDefined"
+
+# Every accessory has an information service, and HAP accessories a protocol
+# service. The Home app shows neither as a tile.
+HIDDEN_SERVICE_TYPES = frozenset(
+    {
+        bytes.fromhex("0000003E0000100080000026BB765291"),
+        bytes.fromhex("000000A20000100080000026BB765291"),
+    }
+)
 
 EVENT_CLASS_LABELS = {
     "MKFCalendarEvent": "calendar",
@@ -56,6 +69,15 @@ _REQUIRED_CLASSES = (
 
 
 @dataclass(frozen=True)
+class MediaLink:
+    """The table that links a media playback action to each speaker it controls."""
+
+    table: str
+    accessory_column: str
+    action_column: str
+
+
+@dataclass(frozen=True)
 class StoreSchema:
     """Ids and the trigger-to-action-set link for one snapshot."""
 
@@ -66,6 +88,7 @@ class StoreSchema:
     junction: str
     action_column: str
     trigger_column: str
+    media: MediaLink | None = None
 
     def label(self, kind: str, entity_id: int | None) -> str:
         if entity_id is None:
@@ -93,6 +116,18 @@ def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
 
 def column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
     return column in table_columns(connection, table)
+
+
+def column_or_null(columns: set[str], alias: str, column: str) -> str:
+    """A column for a SELECT, or NULL when this snapshot's table does not have it."""
+    return f"{alias}.{column}" if column in columns else "NULL"
+
+
+def model_key(model: object, pk: object) -> str:
+    """HomeKit's model id, which survives a rename, else the row id."""
+    if isinstance(model, bytes) and model:
+        return model.hex()
+    return f"pk:{pk}"
 
 
 def table_exists(connection: sqlite3.Connection, name: str) -> bool:
@@ -163,6 +198,7 @@ def load_schema(connection: sqlite3.Connection) -> StoreSchema:
         junction=junction,
         action_column=action_column,
         trigger_column=trigger_column,
+        media=_media_link(connection),
     )
 
 
@@ -199,6 +235,21 @@ def _junction(connection: sqlite3.Connection) -> tuple[str, str, str]:
         found = ", ".join(tables) if tables else "none"
         raise SnapshotError(f"Could not find the trigger-to-action-set link. Tables: {found}")
     return matches[0]
+
+
+def _media_link(connection: sqlite3.Connection) -> MediaLink | None:
+    """Find the accessory-to-media-action table. CoreData numbers its name per store."""
+    found: list[MediaLink] = []
+    for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Z\\_%ACTIONMEDIAPLAYBACKS\\_' ESCAPE '\\'"
+    ):
+        name = str(row[0])
+        columns = [str(item[1]) for item in connection.execute(f"PRAGMA table_info({quote_ident(name)})")]
+        accessories = [column for column in columns if column.endswith("ACCESSORIES_")]
+        actions = [column for column in columns if column.endswith("ACTIONMEDIAPLAYBACKS_")]
+        if len(accessories) == 1 and len(actions) == 1:
+            found.append(MediaLink(name, accessories[0], actions[0]))
+    return found[0] if len(found) == 1 else None
 
 
 def _readonly_uri(path: Path) -> str:
