@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/tbaur/homekit-map/compare/v1.1.0...v1.2.0) (2026-11-26)
+
+
+### Features
+
+* fix on/off values, show conditions and triggers, diff all renames ([#9](https://github.com/tbaur/homekit-map/issues/9)) ([16c4948](https://github.com/tbaur/homekit-map/commit/16c49481147e74efd8ac17bc1b1384bcf7830340))
+
 ## [1.1.0](https://github.com/tbaur/homekit-map/compare/v1.0.0...v1.1.0) (2026-10-31)
 
 
